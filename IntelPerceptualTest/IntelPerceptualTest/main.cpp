@@ -23,23 +23,69 @@ void dump2file(const string& filename, const vector<T>& data, int width, int hei
 	fout.close();
 }
 
+template <typename T>
+vector<T> knn(const vector<T>& data, int width, int height, int ws) {
+	vector<T> outdata(data.size());
+
+	for(int i=0, idx=0;i<height;i++) {
+		for(int j=0;j<width;j++, idx++) {
+			if( data[idx] > 0 ) outdata[idx] = data[idx];
+			else {
+				// interpolation with nearest neighbors
+				T vsum = 0;
+				T wsum = 0;
+				int hitcount = 0;
+				const int minhit = 3;
+
+				for(int nx=-ws;nx<=ws;nx++) {
+					for(int ny=-ws;ny<=ws;ny++) {
+						int x = j+nx;
+						int y = i+ny;
+
+						if( x<0 || x >= width ) continue;
+						if( y<0 || y >= height ) continue;
+
+						int vidx = y*width+x;
+						T val = data[vidx];
+						if( val > 0 ) {
+							float w = sqrtf(nx*nx+ny*ny);
+							vsum += val * w;
+							wsum += w;
+							hitcount++;
+						}
+					}
+				}
+
+				if( wsum > 0 && hitcount > minhit ) {
+					outdata[idx] = vsum / wsum;
+				}
+				else outdata[idx] = -1;
+			}
+		}
+	}
+
+	return outdata;
+}
+
 int main(int argc, char* argv[]) {
 	// use pipeline for aligned image
-	UtilPipeline pp;
-	pp.EnableImage(PXCImage::COLOR_FORMAT_RGB32);
-	pp.EnableImage(PXCImage::COLOR_FORMAT_DEPTH);
-	pp.Init();
+	UtilPipeline pflt;
+    pflt.QueryCapture()->SetFilter(PXCCapture::Device::PROPERTY_DEPTH_SMOOTHING,true);		// use smoothed depth
+	pflt.EnableImage(PXCImage::COLOR_FORMAT_RGB32);
+    pflt.EnableImage(PXCImage::COLOR_FORMAT_DEPTH);
+    pflt.Init();
 
-	PXCSession* ss = pp.QuerySession();
-	PXCCapture::Device *dev = pp.QueryCapture()->QueryDevice();
+
+	PXCSession* ss = pflt.QuerySession();
+	PXCCapture::Device *dev = pflt.QueryCapture()->QueryDevice();
 
 	UtilRender color_render(L"Color Stream");
 	UtilRender depth_render(L"Depth Stream");
 
 	for (int i=0;;i++) {
-		if (!pp.AcquireFrame(true)) break;
-		PXCImage *color_image=pp.QueryImage(PXCImage::IMAGE_TYPE_COLOR);
-		PXCImage *depth_image=pp.QueryImage(PXCImage::IMAGE_TYPE_DEPTH);
+		if (!pflt.AcquireFrame(true)) break;
+		PXCImage *color_image=pflt.QueryImage(PXCImage::IMAGE_TYPE_COLOR);
+		PXCImage *depth_image=pflt.QueryImage(PXCImage::IMAGE_TYPE_DEPTH);
 		
 		// save the captured images
 		if( i % 150 == 0 ) {
@@ -89,9 +135,10 @@ int main(int argc, char* argv[]) {
 			float maxDistance = 2000;
 			float scaleZ = 1.0f;
 
+#define MAP_TO_COLOR 1
 #if MAP_TO_COLOR
-			vector<float> depthimg(rgbinfo.width*rgbinfo.height, -1);
-#if 0
+			vector<float> depthimg(rgbinfo.width*rgbinfo.height, -1.0);
+
 			// mapping from depth to color image, the mapped depth scatter around the color image space
 			float *uvmap = (float*)depthData.planes[2];
 			// process the image
@@ -102,71 +149,29 @@ int main(int argc, char* argv[]) {
 					int x = uvmap[idx*2] * rgbinfo.width;
 					int y = uvmap[idx*2+1] * rgbinfo.height;
 
+					int cidx = y * rgbinfo.width + x;
+
 					if ( depth < minDistance || depth > maxDistance ) { 
 						// mark as bad point
-						depth = -1.0;
+						depthimg[cidx] = -1.0;
 					}
+					else {
 
-					// normalize depth, not necessary
-					//depth = (depth-minDistance) / (maxDistance-minDistance);
-					int cidx = y * rgbinfo.width + x;
-					depthimg[cidx] = depth;
+						// normalize depth, not necessary
+						//depth = (depth-minDistance) / (maxDistance-minDistance);
+						if( depthimg[cidx] < 0 ) depthimg[cidx] = depth;
+						else depthimg[cidx] = min(depth, depthimg[cidx]);
+					}
 					src ++;
 				}
 			}
-#else
-			/* Retrieve the PXCProject serializable identifier */
-			pxcUID uid;
-			dev->QueryPropertyAsUID(PXCCapture::Device::PROPERTY_PROJECTION_SERIALIZABLE, &uid);
 
-			/* Recreate the PXCProject instance */
-			PXCSmartPtr<PXCProjection> pj;
-			ss->DynamicCast<PXCMetadata>()->CreateSerializable<PXCProjection>(uid,&pj);
-			pxcU32 uvInvPitch;
-			uvInvPitch = rgbData.pitches[0];
-			PXCSizeU32 uvInvRoi;
-			vector<PXCPointF32> posd(rgbinfo.height*rgbinfo.width);
-			for (int i=0, idx=0; i<rgbinfo.height; i++) {
-				for (int j=0; j<rgbinfo.width; j++, idx++) {
-					PXCPointF32& p = posd[idx];
-					p.x = j;
-					p.y = i;
-				}
-			}
-			uvInvRoi.width = rgbinfo.width;
-			uvInvRoi.height = rgbinfo.height;				
-
-			// @bug This function is not implemented yet. Need to calibrate the camera before using it.
-			pj->MapColorCoordinatesToDepth( depth_image, &posd[0], uvInvPitch, uvInvRoi );
-
-			// process the image
-			for (int i=0, idx=0; i<rgbinfo.height; i++) {
-				for (int j=0; j<rgbinfo.width; j++, idx++) {
-					const PXCPointF32 p = posd[idx];
-					int x = p.x, y = p.y;
-					float depth;
-					if( x < 0 || y < 0 || x >= rgbinfo.width || y >= rgbinfo.height - 1 ) {
-						depth = -1.0;
-					}
-					else {
-						int didx = y * depthinfo.width + x;
-						depth = (float)src[didx];
-					}
-					if ( depth < minDistance || depth > maxDistance ) { 
-						// mark as bad point
-						depth = -1.0;
-					}
-
-					// normalize depth, not necessary
-					//depth = (depth-minDistance) / (maxDistance-minDistance);
-					depthimg[idx] = depth;
-				}
-				cout << i << endl;
-			}
-#endif
-
+			// apply knn filters to the sparse depth map, with decreasing window size
+			depthimg = knn(depthimg, rgbinfo.width, rgbinfo.height, 3);
+			depthimg = knn(depthimg, rgbinfo.width, rgbinfo.height, 2);
+			depthimg = knn(depthimg, rgbinfo.width, rgbinfo.height, 1);
 			// save it to file
-			dump2file<float>("depth.bin", depthimg, rgbinfo.width, rgbinfo.height, 1);
+			dump2file<float>("depth_" + idxstr + ".bin", depthimg, rgbinfo.width, rgbinfo.height, 1);
 #else
 			vector<float> depthimg(depthinfo.width*depthinfo.height, -1);
 
@@ -198,8 +203,8 @@ int main(int argc, char* argv[]) {
 		if (!color_render.RenderFrame(color_image)) break;
 		if (!depth_render.RenderFrame(depth_image)) break;
 
-		pp.ReleaseFrame();
+		pflt.ReleaseFrame();
 	}
-	pp.Close();
+	pflt.Close();
 	return 0;
 }
